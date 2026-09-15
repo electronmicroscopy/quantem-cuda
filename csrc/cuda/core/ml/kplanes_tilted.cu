@@ -41,10 +41,16 @@
  * Semantics match F.grid_sample(align_corners=True, padding_mode="border")
  * exactly, gradients included.
  *
+ * Two plane layouts, one set of kernels (see PlaneGeom below):
+ *   SINGLE  one tensor  grid [3T, H, W, C], plane index t*3 + p — all three
+ *           plane types share one resolution (the original entry points,
+ *           *_fuse / *_tv_fuse).
+ *   PER-TYPE three tensors grid_p [T, H_p, W_p, C], one per plane type, each
+ *           with its own resolution (the *_fuse3 / *_tv_fuse3 entry points).
+ *
  * Layouts (all contiguous fp32):
  *   pts  [B, 3]         points in [-1, 1]³ (border-clamped outside)
  *   R    [T, 3, 3]      rotation matrices, row-major
- *   grid [3T, H, W, C]  channels-last; plane index = t*3 + p, p: XY, ZX, YZ
  *   out  [B, T*C]       out[b, t*C + c] = Π_p sample(plane(t,p), c)
  *
  * Plane coordinate pairs (gx → W axis, gy → H axis, matching grid_sample's
@@ -52,12 +58,25 @@
  *   p=0 XY: (gx, gy) = (rx, ry)
  *   p=1 ZX: (gx, gy) = (rz, rx)
  *   p=2 YZ: (gx, gy) = (ry, rz)
+ * (rx, ry, rz are components 0, 1, 2 of the rotated point.)
  */
 
 #include "common.cuh"
 #include "ops/core/ml.h"
 
 namespace {
+
+/* Per-plane-type geometry, the only thing that differs between the two
+ * layouts. One struct serves both, so the kernels below are shared:
+ *   SINGLE   [3T, H, W, C]:  base[p] = grid + p·H·W·C, tstride = 3·H·W·C
+ *   PER-TYPE [T, H_p, W_p, C]: base[p] = grid_p,       tstride = H_p·W_p·C
+ * Both give exactly the addresses the single-tensor kernel used before, so
+ * the original entry points keep their numerics bit for bit. */
+struct PlaneGeom {
+    long tstride[3]; // elements between consecutive rotations of plane type p
+    int H[3];
+    int W[3];
+};
 
 struct Tap {
     int off[4];     // corner offsets into a (H, W, C) plane, +1 sides clamped
@@ -104,9 +123,12 @@ __device__ __forceinline__ void rotate(
 __global__ void kplanes_tilted_fwd_kernel(
     const float *__restrict__ pts,
     const float *__restrict__ R,
-    const float *__restrict__ grid, // [3T, H, W, C] channels-last
+    const float *__restrict__ g0, // plane-type bases, channels-last
+    const float *__restrict__ g1,
+    const float *__restrict__ g2,
+    PlaneGeom geom,
     float *__restrict__ out,
-    long B, int T, int C, int H, int W
+    long B, int T, int C
 ) {
     extern __shared__ float sR[]; // [T*9]
     for (int i = threadIdx.x; i < T * 9; i += blockDim.x) sR[i] = R[i];
@@ -123,15 +145,15 @@ __global__ void kplanes_tilted_fwd_kernel(
     float rx, ry, rz;
     rotate(sR + t * 9, px, py, pz, rx, ry, rz);
 
-    const long planeHWC = (long)H * W * C;
+    const float *const gbase[3] = {g0, g1, g2};
     const float gxs[3] = {rx, rz, ry};
     const float gys[3] = {ry, rx, rz};
 
     float prod = 1.f;
 #pragma unroll
     for (int p = 0; p < 3; ++p) {
-        const Tap tp = make_tap(gxs[p], gys[p], H, W, C);
-        const float *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+        const Tap tp = make_tap(gxs[p], gys[p], geom.H[p], geom.W[p], C);
+        const float *pc = gbase[p] + (long)t * geom.tstride[p] + c;
         prod *= tp.w[0] * pc[tp.off[0]] + tp.w[1] * pc[tp.off[1]] + tp.w[2] * pc[tp.off[2]]
               + tp.w[3] * pc[tp.off[3]];
     }
@@ -141,12 +163,17 @@ __global__ void kplanes_tilted_fwd_kernel(
 __global__ void kplanes_tilted_bwd_kernel(
     const float *__restrict__ pts,
     const float *__restrict__ R,
-    const float *__restrict__ grid, // [3T, H, W, C] channels-last
+    const float *__restrict__ g0, // plane-type bases, channels-last
+    const float *__restrict__ g1,
+    const float *__restrict__ g2,
+    PlaneGeom geom,
     const float *__restrict__ gout, // [B, T*C]
-    float *__restrict__ ggrid,      // [3T, H, W, C], pre-zeroed
+    float *__restrict__ gg0,        // grads for the plane bases, pre-zeroed
+    float *__restrict__ gg1,
+    float *__restrict__ gg2,
     float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
     float *__restrict__ gpts,       // [B, 3], pre-zeroed
-    long B, int T, int C, int H, int W
+    long B, int T, int C
 ) {
     extern __shared__ float smem[]; // [T*9] R copy | [T*9] gR partials
     float *sR = smem;
@@ -191,7 +218,8 @@ __global__ void kplanes_tilted_bwd_kernel(
     float rx, ry, rz;
     rotate(Rt, px, py, pz, rx, ry, rz);
 
-    const long planeHWC = (long)H * W * C;
+    const float *const gbase[3] = {g0, g1, g2};
+    float *const ggbase[3] = {gg0, gg1, gg2};
     const float gxs[3] = {rx, rz, ry};
     const float gys[3] = {ry, rx, rz};
 
@@ -204,9 +232,9 @@ __global__ void kplanes_tilted_bwd_kernel(
         const float go = gout[group * C + c]; // gout[b, t*C + c]
 #pragma unroll
         for (int p = 0; p < 3; ++p) {
-            tap[p] = make_tap(gxs[p], gys[p], H, W, C);
+            tap[p] = make_tap(gxs[p], gys[p], geom.H[p], geom.W[p], C);
             const Tap tp = tap[p];
-            const float *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+            const float *pc = gbase[p] + (long)t * geom.tstride[p] + c;
             const float v0 = pc[tp.off[0]], v1 = pc[tp.off[1]];
             const float v2 = pc[tp.off[2]], v3 = pc[tp.off[3]];
             s[p] = v0 * tp.w[0] + v1 * tp.w[1] + v2 * tp.w[2] + v3 * tp.w[3];
@@ -221,7 +249,7 @@ __global__ void kplanes_tilted_bwd_kernel(
             // d(prod)/d(s_p) = product of the other two plane samples
             const float other = s[(p + 1) % 3] * s[(p + 2) % 3] * go;
             const Tap tp = tap[p];
-            float *gpc = ggrid + (long)(t * 3 + p) * planeHWC + c;
+            float *gpc = ggbase[p] + (long)t * geom.tstride[p] + c;
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const float val = other * tp.w[k];
@@ -249,9 +277,9 @@ __global__ void kplanes_tilted_bwd_kernel(
         // Map plane-coordinate grads back to the rotated point
         // (gx, gy) per plane: XY=(rx,ry), ZX=(rz,rx), YZ=(ry,rz).
         // make_tap is deterministic, so recomputing the masks is exact.
-        const Tap t0 = make_tap(gxs[0], gys[0], H, W, C);
-        const Tap t1 = make_tap(gxs[1], gys[1], H, W, C);
-        const Tap t2 = make_tap(gxs[2], gys[2], H, W, C);
+        const Tap t0 = make_tap(gxs[0], gys[0], geom.H[0], geom.W[0], C);
+        const Tap t1 = make_tap(gxs[1], gys[1], geom.H[1], geom.W[1], C);
+        const Tap t2 = make_tap(gxs[2], gys[2], geom.H[2], geom.W[2], C);
         const float drx = dgx[0] * t0.gxm + dgy[1] * t1.gym;
         const float dry = dgy[0] * t0.gym + dgx[2] * t2.gxm;
         const float drz = dgx[1] * t1.gxm + dgy[2] * t2.gym;
@@ -284,6 +312,37 @@ constexpr int kThreads = 256;
 
 inline int n_blocks(long n) { return (int)((n + kThreads - 1) / kThreads); }
 
+/* One tensor [3T, H, W, C]: plane type p of rotation t starts at
+ * (t*3 + p)·H·W·C, i.e. base p·H·W·C with a per-rotation stride of 3·H·W·C. */
+inline PlaneGeom geom_single(int C, int H, int W) {
+    const long hwc = (long)H * W * C;
+    PlaneGeom g;
+    for (int p = 0; p < 3; ++p) {
+        g.tstride[p] = 3 * hwc;
+        g.H[p] = H;
+        g.W[p] = W;
+    }
+    return g;
+}
+
+/* Three tensors, plane type p being [T, H_p, W_p, C]. */
+inline PlaneGeom geom_triple(int C, int H0, int W0, int H1, int W1, int H2, int W2) {
+    PlaneGeom g;
+    g.H[0] = H0; g.W[0] = W0;
+    g.H[1] = H1; g.W[1] = W1;
+    g.H[2] = H2; g.W[2] = W2;
+    for (int p = 0; p < 3; ++p) g.tstride[p] = (long)g.H[p] * g.W[p] * C;
+    return g;
+}
+
+inline long bwd_warps(long n_groups, int C) {
+    if (C <= 32) {
+        const int spw = 32 / (C < 32 ? C : 32);
+        return (n_groups + spw - 1) / spw;
+    }
+    return n_groups * ((C + 31) >> 5);
+}
+
 } // namespace
 
 void kplanes_tilted_fuse_cuda(
@@ -295,9 +354,11 @@ void kplanes_tilted_fuse_cuda(
     cudaStream_t stream
 ) {
     if (B == 0) return;
+    const long hwc = (long)H * W * C;
     const size_t shmem = (size_t)T * 9 * sizeof(float);
     kplanes_tilted_fwd_kernel<<<n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
-        d_pts, d_R, d_grid, d_out, B, T, C, H, W);
+        d_pts, d_R, d_grid, d_grid + hwc, d_grid + 2 * hwc, geom_single(C, H, W),
+        d_out, B, T, C);
     CUDA_CHECK_KERNEL();
 }
 
@@ -313,16 +374,57 @@ void kplanes_tilted_fuse_grad_cuda(
     cudaStream_t stream
 ) {
     if (B == 0) return;
-    long n_warps;
-    if (C <= 32) {
-        const int spw = 32 / (C < 32 ? C : 32);
-        n_warps = (B * (long)T + spw - 1) / spw;
-    } else {
-        n_warps = B * (long)T * ((C + 31) >> 5);
-    }
+    const long hwc = (long)H * W * C;
+    const long n_warps = bwd_warps(B * (long)T, C);
     const size_t shmem = (size_t)T * 18 * sizeof(float);
     kplanes_tilted_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
-        d_pts, d_R, d_grid, d_gout, d_ggrid, d_gR, d_gpts, B, T, C, H, W);
+        d_pts, d_R, d_grid, d_grid + hwc, d_grid + 2 * hwc, geom_single(C, H, W),
+        d_gout, d_ggrid, d_ggrid + hwc, d_ggrid + 2 * hwc, d_gR, d_gpts, B, T, C);
+    CUDA_CHECK_KERNEL();
+}
+
+void kplanes_tilted_fuse3_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const float *d_plane0,
+    const float *d_plane1,
+    const float *d_plane2,
+    float *d_out,
+    long B, int T, int C,
+    int H0, int W0, int H1, int W1, int H2, int W2,
+    cudaStream_t stream
+) {
+    if (B == 0) return;
+    const size_t shmem = (size_t)T * 9 * sizeof(float);
+    kplanes_tilted_fwd_kernel<<<n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
+        d_pts, d_R, d_plane0, d_plane1, d_plane2,
+        geom_triple(C, H0, W0, H1, W1, H2, W2), d_out, B, T, C);
+    CUDA_CHECK_KERNEL();
+}
+
+void kplanes_tilted_fuse3_grad_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const float *d_plane0,
+    const float *d_plane1,
+    const float *d_plane2,
+    const float *d_gout,
+    float *d_gplane0,
+    float *d_gplane1,
+    float *d_gplane2,
+    float *d_gR,
+    float *d_gpts,
+    long B, int T, int C,
+    int H0, int W0, int H1, int W1, int H2, int W2,
+    cudaStream_t stream
+) {
+    if (B == 0) return;
+    const long n_warps = bwd_warps(B * (long)T, C);
+    const size_t shmem = (size_t)T * 18 * sizeof(float);
+    kplanes_tilted_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+        d_pts, d_R, d_plane0, d_plane1, d_plane2,
+        geom_triple(C, H0, W0, H1, W1, H2, W2),
+        d_gout, d_gplane0, d_gplane1, d_gplane2, d_gR, d_gpts, B, T, C);
     CUDA_CHECK_KERNEL();
 }
 
@@ -347,17 +449,23 @@ void kplanes_tilted_fuse_grad_cuda(
  * The backward has a correctness trap in grad_R: R enters the computation
  * both through R·x (all 4 taps) and through h·R[:,i] (taps 1-3). The full
  * gradient is the sum of both contributions — see the backward kernel comment.
+ *
+ * Both plane layouts go through these kernels via PlaneGeom, exactly as in
+ * the base variant.
  */
 
-namespace {  // tv namespace (reuse make_tap / rotate from above)
+namespace {  // tv namespace (reuse make_tap / rotate / PlaneGeom from above)
 
 /* ── TV forward kernel ────────────────────────────────────────────────────── */
 __global__ void kplanes_tilted_tv_fwd_kernel(
     const float *__restrict__ pts,
     const float *__restrict__ R,
-    const float *__restrict__ grid, // [3T, H, W, C] channels-last
+    const float *__restrict__ g0, // plane-type bases, channels-last
+    const float *__restrict__ g1,
+    const float *__restrict__ g2,
+    PlaneGeom geom,
     float *__restrict__ out,        // [4, B, T*C] — tap outermost
-    long B, int T, int C, int H, int W,
+    long B, int T, int C,
     float h
 ) {
     // Shared: [T*9] R copy + [T*9] columns h*R[:,0..2] (the 3 tap offsets)
@@ -409,15 +517,15 @@ __global__ void kplanes_tilted_tv_fwd_kernel(
         rz += rc[2];
     }
 
-    const long planeHWC = (long)H * W * C;
+    const float *const gbase[3] = {g0, g1, g2};
     const float gxs[3] = {rx, rz, ry};
     const float gys[3] = {ry, rx, rz};
 
     float prod = 1.f;
 #pragma unroll
     for (int p = 0; p < 3; ++p) {
-        const Tap tp = make_tap(gxs[p], gys[p], H, W, C);
-        const float *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+        const Tap tp = make_tap(gxs[p], gys[p], geom.H[p], geom.W[p], C);
+        const float *pc = gbase[p] + (long)t * geom.tstride[p] + c;
         prod *= tp.w[0] * pc[tp.off[0]] + tp.w[1] * pc[tp.off[1]]
               + tp.w[2] * pc[tp.off[2]] + tp.w[3] * pc[tp.off[3]];
     }
@@ -446,12 +554,17 @@ __global__ void kplanes_tilted_tv_fwd_kernel(
 __global__ void kplanes_tilted_tv_bwd_kernel(
     const float *__restrict__ pts,
     const float *__restrict__ R,
-    const float *__restrict__ grid, // [3T, H, W, C] channels-last
+    const float *__restrict__ g0, // plane-type bases, channels-last
+    const float *__restrict__ g1,
+    const float *__restrict__ g2,
+    PlaneGeom geom,
     const float *__restrict__ gout, // [4, B, T*C]
-    float *__restrict__ ggrid,      // [3T, H, W, C], pre-zeroed
+    float *__restrict__ gg0,        // grads for the plane bases, pre-zeroed
+    float *__restrict__ gg1,
+    float *__restrict__ gg2,
     float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
     float *__restrict__ gpts,       // [B, 3], pre-zeroed
-    long B, int T, int C, int H, int W,
+    long B, int T, int C,
     float h
 ) {
     extern __shared__ float smem[]; // [T*9] R | [T*9] h*R cols | [T*9] gR partials
@@ -512,7 +625,8 @@ __global__ void kplanes_tilted_tv_bwd_kernel(
         rz += rc[2];
     }
 
-    const long planeHWC = (long)H * W * C;
+    const float *const gbase[3] = {g0, g1, g2};
+    float *const ggbase[3] = {gg0, gg1, gg2};
     const float gxs[3] = {rx, rz, ry};
     const float gys[3] = {ry, rx, rz};
 
@@ -527,9 +641,9 @@ __global__ void kplanes_tilted_tv_bwd_kernel(
         const float go = gout[gout_off];
 #pragma unroll
         for (int p = 0; p < 3; ++p) {
-            taps[p] = make_tap(gxs[p], gys[p], H, W, C);
+            taps[p] = make_tap(gxs[p], gys[p], geom.H[p], geom.W[p], C);
             const Tap tp = taps[p];
-            const float *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+            const float *pc = gbase[p] + (long)t * geom.tstride[p] + c;
             const float v0 = pc[tp.off[0]], v1 = pc[tp.off[1]];
             const float v2 = pc[tp.off[2]], v3 = pc[tp.off[3]];
             s[p] = v0 * tp.w[0] + v1 * tp.w[1] + v2 * tp.w[2] + v3 * tp.w[3];
@@ -540,7 +654,7 @@ __global__ void kplanes_tilted_tv_bwd_kernel(
         for (int p = 0; p < 3; ++p) {
             const float other = s[(p + 1) % 3] * s[(p + 2) % 3] * go;
             const Tap tp = taps[p];
-            float *gpc = ggrid + (long)(t * 3 + p) * planeHWC + c;
+            float *gpc = ggbase[p] + (long)t * geom.tstride[p] + c;
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const float val = other * tp.w[k];
@@ -566,9 +680,9 @@ __global__ void kplanes_tilted_tv_bwd_kernel(
 
     if (active && lis == 0) {
         // Map plane-coordinate grads to rotated-space components (same as base).
-        const Tap t0 = make_tap(gxs[0], gys[0], H, W, C);
-        const Tap t1 = make_tap(gxs[1], gys[1], H, W, C);
-        const Tap t2 = make_tap(gxs[2], gys[2], H, W, C);
+        const Tap t0 = make_tap(gxs[0], gys[0], geom.H[0], geom.W[0], C);
+        const Tap t1 = make_tap(gxs[1], gys[1], geom.H[1], geom.W[1], C);
+        const Tap t2 = make_tap(gxs[2], gys[2], geom.H[2], geom.W[2], C);
         const float drx = dgx[0] * t0.gxm + dgy[1] * t1.gym;
         const float dry = dgy[0] * t0.gym + dgx[2] * t2.gxm;
         const float drz = dgx[1] * t1.gxm + dgy[2] * t2.gym;
@@ -623,10 +737,12 @@ void kplanes_tilted_tv_fuse_cuda(
     cudaStream_t stream
 ) {
     if (B == 0) return;
+    const long hwc = (long)H * W * C;
     // shmem: [T*9] R + [T*9] h*R columns = T*18 floats
     const size_t shmem = (size_t)T * 18 * sizeof(float);
     kplanes_tilted_tv_fwd_kernel<<<n_blocks(4L * B * (long)(T * C)), kThreads, shmem, stream>>>(
-        d_pts, d_R, d_grid, d_out, B, T, C, H, W, h);
+        d_pts, d_R, d_grid, d_grid + hwc, d_grid + 2 * hwc, geom_single(C, H, W),
+        d_out, B, T, C, h);
     CUDA_CHECK_KERNEL();
 }
 
@@ -643,16 +759,59 @@ void kplanes_tilted_tv_fuse_grad_cuda(
     cudaStream_t stream
 ) {
     if (B == 0) return;
-    long n_warps;
-    if (C <= 32) {
-        const int spw = 32 / (C < 32 ? C : 32);
-        n_warps = (4L * B * (long)T + spw - 1) / spw;
-    } else {
-        n_warps = 4L * B * (long)T * ((C + 31) >> 5);
-    }
+    const long hwc = (long)H * W * C;
+    const long n_warps = bwd_warps(4L * B * (long)T, C);
     // shmem: [T*9] R + [T*9] h*R cols + [T*9] gR partials = T*27 floats
     const size_t shmem = (size_t)T * 27 * sizeof(float);
     kplanes_tilted_tv_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
-        d_pts, d_R, d_grid, d_gout, d_ggrid, d_gR, d_gpts, B, T, C, H, W, h);
+        d_pts, d_R, d_grid, d_grid + hwc, d_grid + 2 * hwc, geom_single(C, H, W),
+        d_gout, d_ggrid, d_ggrid + hwc, d_ggrid + 2 * hwc, d_gR, d_gpts, B, T, C, h);
+    CUDA_CHECK_KERNEL();
+}
+
+void kplanes_tilted_tv_fuse3_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const float *d_plane0,
+    const float *d_plane1,
+    const float *d_plane2,
+    float *d_out,
+    long B, int T, int C,
+    int H0, int W0, int H1, int W1, int H2, int W2,
+    float h,
+    cudaStream_t stream
+) {
+    if (B == 0) return;
+    const size_t shmem = (size_t)T * 18 * sizeof(float);
+    kplanes_tilted_tv_fwd_kernel<<<n_blocks(4L * B * (long)(T * C)), kThreads, shmem, stream>>>(
+        d_pts, d_R, d_plane0, d_plane1, d_plane2,
+        geom_triple(C, H0, W0, H1, W1, H2, W2), d_out, B, T, C, h);
+    CUDA_CHECK_KERNEL();
+}
+
+void kplanes_tilted_tv_fuse3_grad_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const float *d_plane0,
+    const float *d_plane1,
+    const float *d_plane2,
+    const float *d_gout,
+    float *d_gplane0,
+    float *d_gplane1,
+    float *d_gplane2,
+    float *d_gR,
+    float *d_gpts,
+    long B, int T, int C,
+    int H0, int W0, int H1, int W1, int H2, int W2,
+    float h,
+    cudaStream_t stream
+) {
+    if (B == 0) return;
+    const long n_warps = bwd_warps(4L * B * (long)T, C);
+    const size_t shmem = (size_t)T * 27 * sizeof(float);
+    kplanes_tilted_tv_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+        d_pts, d_R, d_plane0, d_plane1, d_plane2,
+        geom_triple(C, H0, W0, H1, W1, H2, W2),
+        d_gout, d_gplane0, d_gplane1, d_gplane2, d_gR, d_gpts, B, T, C, h);
     CUDA_CHECK_KERNEL();
 }

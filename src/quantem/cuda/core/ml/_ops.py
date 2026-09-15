@@ -44,7 +44,8 @@ def _kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tenso
 
 @_kplanes_tilted_fuse.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor:
-    return pts.new_empty((pts.shape[0], rotations.shape[0] * plane.shape[1]))
+    # the real op always allocates a fresh fp32 output, whatever pts' dtype
+    return pts.new_empty((pts.shape[0], rotations.shape[0] * plane.shape[1]), dtype=torch.float32)
 
 
 @torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse_bwd", mutates_args=())
@@ -84,7 +85,14 @@ def _kplanes_tilted_fuse_bwd(
 
 @_kplanes_tilted_fuse_bwd.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor, grad_out: Tensor) -> list[Tensor]:
-    return [torch.empty_like(pts), torch.empty_like(rotations), torch.empty_like(plane)]
+    # new_empty (not empty_like): the real op returns CONTIGUOUS grads even for
+    # non-contiguous inputs (it zeros_like the .contiguous() copies), so the fake
+    # must not inherit input strides.
+    return [
+        pts.new_empty(pts.shape),
+        rotations.new_empty(rotations.shape),
+        plane.new_empty(plane.shape),
+    ]
 
 
 def _kpt_setup_context(ctx, inputs, output) -> None:
@@ -142,7 +150,10 @@ def _kplanes_tilted_tv_fuse(pts: Tensor, rotations: Tensor, plane: Tensor, h: fl
 
 @_kplanes_tilted_tv_fuse.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor, h: float) -> Tensor:
-    return pts.new_empty((4, pts.shape[0], rotations.shape[0] * plane.shape[1]))
+    # the real op always allocates a fresh fp32 output, whatever pts' dtype
+    return pts.new_empty(
+        (4, pts.shape[0], rotations.shape[0] * plane.shape[1]), dtype=torch.float32
+    )
 
 
 @torch.library.custom_op("quantem_cuda::kplanes_tilted_tv_fuse_bwd", mutates_args=())
@@ -183,7 +194,12 @@ def _kplanes_tilted_tv_fuse_bwd(
 
 @_kplanes_tilted_tv_fuse_bwd.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor, grad_out: Tensor, h: float) -> list[Tensor]:
-    return [torch.empty_like(pts), torch.empty_like(rotations), torch.empty_like(plane)]
+    # new_empty (not empty_like): matches the real op's contiguous grads (see fwd bwd fake)
+    return [
+        pts.new_empty(pts.shape),
+        rotations.new_empty(rotations.shape),
+        plane.new_empty(plane.shape),
+    ]
 
 
 def _kpt_tv_setup_context(ctx, inputs, output) -> None:
@@ -202,6 +218,277 @@ def _kpt_tv_backward(ctx, grad_out):
 
 
 _kplanes_tilted_tv_fuse.register_autograd(_kpt_tv_backward, setup_context=_kpt_tv_setup_context)
+
+
+# ── per-plane-type resolution variants (fuse3) ────────────────────────────
+#
+# Same computation as the two ops above, but each plane TYPE gets its own
+# tensor and its own (H, W) instead of one [3T, C, H, W] tensor shared by all
+# three. Plane type p samples the coordinate pair of quantem's
+# idx = [[0, 1], [2, 0], [1, 2]] (first entry → grid_sample x / the W axis,
+# second → y / the H axis) of the rotated point:
+#   plane0 [T, C, H0, W0]: (comp 0 → W, comp 1 → H)
+#   plane1 [T, C, H1, W1]: (comp 2 → W, comp 0 → H)
+#   plane2 [T, C, H2, W2]: (comp 1 → W, comp 2 → H)
+# Output layout and channel order are identical to kplanes_tilted_fuse.
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse3", mutates_args=())
+def _kplanes_tilted_fuse3(
+    pts: Tensor, rotations: Tensor, plane0: Tensor, plane1: Tensor, plane2: Tensor
+) -> Tensor:
+    p = pts.contiguous()
+    r = rotations.contiguous()
+    c = plane0.shape[1]
+    g = [_channels_last(pl) for pl in (plane0, plane1, plane2)]
+    hw = [(int(pl.shape[2]), int(pl.shape[3])) for pl in (plane0, plane1, plane2)]
+    b = p.shape[0]
+    t = r.shape[0]
+    out = torch.empty((b, t * c), dtype=torch.float32, device=p.device)
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_tilted_fuse3_cuda(
+            p.data_ptr(),
+            r.data_ptr(),
+            g[0].data_ptr(),
+            g[1].data_ptr(),
+            g[2].data_ptr(),
+            out.data_ptr(),
+            b,
+            t,
+            c,
+            hw[0][0],
+            hw[0][1],
+            hw[1][0],
+            hw[1][1],
+            hw[2][0],
+            hw[2][1],
+            stream,
+        )
+    return out
+
+
+@_kplanes_tilted_fuse3.register_fake
+def _(pts: Tensor, rotations: Tensor, plane0: Tensor, plane1: Tensor, plane2: Tensor) -> Tensor:
+    # the real op always allocates a fresh fp32 output, whatever pts' dtype
+    return pts.new_empty((pts.shape[0], rotations.shape[0] * plane0.shape[1]), dtype=torch.float32)
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse3_bwd", mutates_args=())
+def _kplanes_tilted_fuse3_bwd(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+) -> list[Tensor]:
+    p = pts.contiguous()
+    r = rotations.contiguous()
+    c = plane0.shape[1]
+    g = [_channels_last(pl) for pl in (plane0, plane1, plane2)]
+    hw = [(int(pl.shape[2]), int(pl.shape[3])) for pl in (plane0, plane1, plane2)]
+    b = p.shape[0]
+    t = r.shape[0]
+    gout = grad_out.detach().to(dtype=torch.float32, device=p.device).contiguous()
+    grad_pts = torch.zeros_like(p)  # accumulated across the T threads per point
+    grad_r = torch.zeros_like(r)
+    grad_planes_cl = [torch.zeros_like(gi) for gi in g]
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_tilted_fuse3_grad_cuda(
+            p.data_ptr(),
+            r.data_ptr(),
+            g[0].data_ptr(),
+            g[1].data_ptr(),
+            g[2].data_ptr(),
+            gout.data_ptr(),
+            grad_planes_cl[0].data_ptr(),
+            grad_planes_cl[1].data_ptr(),
+            grad_planes_cl[2].data_ptr(),
+            grad_r.data_ptr(),
+            grad_pts.data_ptr(),
+            b,
+            t,
+            c,
+            hw[0][0],
+            hw[0][1],
+            hw[1][0],
+            hw[1][1],
+            hw[2][0],
+            hw[2][1],
+            stream,
+        )
+    # (T, H, W, C) → (T, C, H, W), matching the parameter layout
+    return [grad_pts, grad_r] + [gp.permute(0, 3, 1, 2).contiguous() for gp in grad_planes_cl]
+
+
+@_kplanes_tilted_fuse3_bwd.register_fake
+def _(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+) -> list[Tensor]:
+    # new_empty (not empty_like): the real op returns CONTIGUOUS grads even for
+    # non-contiguous inputs (it zeros_like the .contiguous() copies), so the fake
+    # must not inherit input strides.
+    return [
+        pts.new_empty(pts.shape),
+        rotations.new_empty(rotations.shape),
+        plane0.new_empty(plane0.shape),
+        plane1.new_empty(plane1.shape),
+        plane2.new_empty(plane2.shape),
+    ]
+
+
+def _kpt3_setup_context(ctx, inputs, output) -> None:
+    pts, rotations, plane0, plane1, plane2 = inputs
+    ctx.save_for_backward(pts, rotations, plane0, plane1, plane2)
+
+
+def _kpt3_backward(ctx, grad_out):
+    pts, rotations, plane0, plane1, plane2 = ctx.saved_tensors
+    grads = _kplanes_tilted_fuse3_bwd(pts, rotations, plane0, plane1, plane2, grad_out)
+    return grads[0], grads[1], grads[2], grads[3], grads[4]
+
+
+_kplanes_tilted_fuse3.register_autograd(_kpt3_backward, setup_context=_kpt3_setup_context)
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_tilted_tv_fuse3", mutates_args=())
+def _kplanes_tilted_tv_fuse3(
+    pts: Tensor, rotations: Tensor, plane0: Tensor, plane1: Tensor, plane2: Tensor, h: float
+) -> Tensor:
+    p = pts.contiguous()
+    r = rotations.contiguous()
+    c = plane0.shape[1]
+    g = [_channels_last(pl) for pl in (plane0, plane1, plane2)]
+    hw = [(int(pl.shape[2]), int(pl.shape[3])) for pl in (plane0, plane1, plane2)]
+    b = p.shape[0]
+    t = r.shape[0]
+    out = torch.empty((4, b, t * c), dtype=torch.float32, device=p.device)
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_tilted_tv_fuse3_cuda(
+            p.data_ptr(),
+            r.data_ptr(),
+            g[0].data_ptr(),
+            g[1].data_ptr(),
+            g[2].data_ptr(),
+            out.data_ptr(),
+            b,
+            t,
+            c,
+            hw[0][0],
+            hw[0][1],
+            hw[1][0],
+            hw[1][1],
+            hw[2][0],
+            hw[2][1],
+            float(h),
+            stream,
+        )
+    return out
+
+
+@_kplanes_tilted_tv_fuse3.register_fake
+def _(
+    pts: Tensor, rotations: Tensor, plane0: Tensor, plane1: Tensor, plane2: Tensor, h: float
+) -> Tensor:
+    # the real op always allocates a fresh fp32 output, whatever pts' dtype
+    return pts.new_empty(
+        (4, pts.shape[0], rotations.shape[0] * plane0.shape[1]), dtype=torch.float32
+    )
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_tilted_tv_fuse3_bwd", mutates_args=())
+def _kplanes_tilted_tv_fuse3_bwd(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+    h: float,
+) -> list[Tensor]:
+    p = pts.contiguous()
+    r = rotations.contiguous()
+    c = plane0.shape[1]
+    g = [_channels_last(pl) for pl in (plane0, plane1, plane2)]
+    hw = [(int(pl.shape[2]), int(pl.shape[3])) for pl in (plane0, plane1, plane2)]
+    b = p.shape[0]
+    t = r.shape[0]
+    gout = grad_out.detach().to(dtype=torch.float32, device=p.device).contiguous()
+    grad_pts = torch.zeros_like(p)
+    grad_r = torch.zeros_like(r)
+    grad_planes_cl = [torch.zeros_like(gi) for gi in g]
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_tilted_tv_fuse3_grad_cuda(
+            p.data_ptr(),
+            r.data_ptr(),
+            g[0].data_ptr(),
+            g[1].data_ptr(),
+            g[2].data_ptr(),
+            gout.data_ptr(),
+            grad_planes_cl[0].data_ptr(),
+            grad_planes_cl[1].data_ptr(),
+            grad_planes_cl[2].data_ptr(),
+            grad_r.data_ptr(),
+            grad_pts.data_ptr(),
+            b,
+            t,
+            c,
+            hw[0][0],
+            hw[0][1],
+            hw[1][0],
+            hw[1][1],
+            hw[2][0],
+            hw[2][1],
+            float(h),
+            stream,
+        )
+    # (T, H, W, C) → (T, C, H, W), matching the parameter layout
+    return [grad_pts, grad_r] + [gp.permute(0, 3, 1, 2).contiguous() for gp in grad_planes_cl]
+
+
+@_kplanes_tilted_tv_fuse3_bwd.register_fake
+def _(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+    h: float,
+) -> list[Tensor]:
+    # new_empty (not empty_like): matches the real op's contiguous grads
+    return [
+        pts.new_empty(pts.shape),
+        rotations.new_empty(rotations.shape),
+        plane0.new_empty(plane0.shape),
+        plane1.new_empty(plane1.shape),
+        plane2.new_empty(plane2.shape),
+    ]
+
+
+def _kpt3_tv_setup_context(ctx, inputs, output) -> None:
+    pts, rotations, plane0, plane1, plane2, h = inputs
+    ctx.save_for_backward(pts, rotations, plane0, plane1, plane2)
+    ctx.h = h
+
+
+def _kpt3_tv_backward(ctx, grad_out):
+    pts, rotations, plane0, plane1, plane2 = ctx.saved_tensors
+    grads = _kplanes_tilted_tv_fuse3_bwd(pts, rotations, plane0, plane1, plane2, grad_out, ctx.h)
+    # h has no gradient
+    return grads[0], grads[1], grads[2], grads[3], grads[4], None
+
+
+_kplanes_tilted_tv_fuse3.register_autograd(_kpt3_tv_backward, setup_context=_kpt3_tv_setup_context)
 
 
 # ── public wrappers ───────────────────────────────────────────────────────
@@ -317,3 +604,125 @@ def kplanes_tilted_tv_fuse(pts: Tensor, rotations: Tensor, plane: Tensor, h: flo
             f"C*H*W must be < 2^31, got plane {tuple(plane.shape)}"
         )
     return _kplanes_tilted_tv_fuse(pts, rotations, plane, float(h))
+
+
+def _validate3(
+    fn: str, pts: Tensor, rotations: Tensor, planes: tuple[Tensor, Tensor, Tensor]
+) -> None:
+    """Shared validation for the per-plane-type (``fuse3``) entry points."""
+    if pts.ndim != 2 or pts.shape[-1] != 3:
+        raise ValueError(f"{fn} expects pts [B, 3], got {tuple(pts.shape)}")
+    if rotations.ndim != 3 or rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"{fn} expects rotations [T, 3, 3], got {tuple(rotations.shape)}")
+    t = rotations.shape[0]
+    for i, plane in enumerate(planes):
+        name = f"plane{i}"
+        if plane.ndim != 4 or plane.shape[0] != t:
+            raise ValueError(
+                f"{fn} expects {name} [T, C, H, W] with T = rotations.shape[0]; "
+                f"got {name} {tuple(plane.shape)} for T={t}"
+            )
+        if plane.shape[1] != planes[0].shape[1]:
+            raise ValueError(
+                f"{fn} expects the same channel count C in all three planes; got "
+                f"plane0 C={planes[0].shape[1]} and {name} C={plane.shape[1]}"
+            )
+        if plane.shape[1] * plane.shape[2] * plane.shape[3] >= 2**31:
+            raise ValueError(
+                f"{fn} uses 32-bit per-plane offsets; C*H*W must be < 2^31, "
+                f"got {name} {tuple(plane.shape)}"
+            )
+    named = (("pts", pts), ("rotations", rotations)) + tuple(
+        (f"plane{i}", p) for i, p in enumerate(planes)
+    )
+    for name, tensor in named:
+        if tensor.dtype != torch.float32:
+            raise TypeError(f"{fn} is fp32-only ({name} is {tensor.dtype}).")
+        if not tensor.is_cuda:
+            raise ValueError(f"{fn} requires CUDA tensors ({name} on {tensor.device}).")
+
+
+def kplanes_tilted_fuse3(
+    pts: Tensor, rotations: Tensor, plane0: Tensor, plane1: Tensor, plane2: Tensor
+) -> Tensor:
+    """:func:`kplanes_tilted_fuse` with a separate resolution per plane type.
+
+    Identical computation, output layout and channel order as
+    :func:`kplanes_tilted_fuse`, except that the three plane types live in
+    three tensors of their own and may have different ``(H, W)``. Plane type
+    ``p`` samples the coordinate pair of quantem's ``idx = [[0, 1], [2, 0],
+    [1, 2]]`` (first entry → ``grid_sample``'s x / the ``W`` axis, second →
+    y / the ``H`` axis) of the rotated point ``R_t @ p``::
+
+        plane0: (component 0 → W, component 1 → H)
+        plane1: (component 2 → W, component 0 → H)
+        plane2: (component 1 → W, component 2 → H)
+
+    Equivalent to::
+
+        rotated = torch.einsum("tij,bj->tbi", rotations, pts)       # (T, B, 3)
+        idx = [[0, 1], [2, 0], [1, 2]]
+        samples = [
+            F.grid_sample(plane, rotated[..., ij].unsqueeze(1),
+                          align_corners=True, mode="bilinear",
+                          padding_mode="border").squeeze(2)         # (T, C, B)
+            for plane, ij in zip((plane0, plane1, plane2), idx)
+        ]
+        out = (samples[0] * samples[1] * samples[2]).permute(2, 0, 1).reshape(B, T * C)
+
+    With all three planes the same shape this returns bit-for-bit the same
+    values as ``kplanes_tilted_fuse`` on the equivalent ``[3T, C, H, W]``
+    tensor (``plane[t*3 + p] == plane<p>[t]``).
+
+    Differentiable w.r.t. all five inputs (analytic CUDA backward, with
+    torch's border-clip zero-gradient convention for coordinates).
+
+    Args:
+        pts:       fp32 CUDA tensor ``[B, 3]``, coordinates in ``[-1, 1]``.
+        rotations: fp32 CUDA tensor ``[T, 3, 3]``.
+        plane0:    fp32 CUDA tensor ``[T, C, H0, W0]``.
+        plane1:    fp32 CUDA tensor ``[T, C, H1, W1]``.
+        plane2:    fp32 CUDA tensor ``[T, C, H2, W2]``.
+
+    Returns:
+        fp32 tensor ``[B, T*C]`` (``out[b, t*C + c]``), differentiable.
+    """
+    _validate3("kplanes_tilted_fuse3", pts, rotations, (plane0, plane1, plane2))
+    return _kplanes_tilted_fuse3(pts, rotations, plane0, plane1, plane2)
+
+
+def kplanes_tilted_tv_fuse3(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    h: float,
+) -> Tensor:
+    """:func:`kplanes_tilted_tv_fuse` with a separate resolution per plane type.
+
+    Same 4-tap contract as :func:`kplanes_tilted_tv_fuse` — ``tap 0`` at
+    ``R_t · x`` and taps 1-3 at ``R_t · x + h·R_t[:, i]`` for the world x, y
+    and z directions — with the three plane types in three tensors of their
+    own, each with its own ``(H, W)``; see :func:`kplanes_tilted_fuse3` for
+    the coordinate pair each plane type uses.
+
+    Output layout: ``[4, B, T*C]`` — tap dimension outermost, ``out[0]``
+    identical in layout to ``kplanes_tilted_fuse3(pts, ...)``.
+
+    ``h`` is a fixed hyperparameter: no gradient is returned for it.
+    Differentiable w.r.t. ``pts``, ``rotations`` and the three planes.
+
+    Args:
+        pts:       fp32 CUDA tensor ``[B, 3]``, coordinates in ``[-1, 1]``.
+        rotations: fp32 CUDA tensor ``[T, 3, 3]``.
+        plane0:    fp32 CUDA tensor ``[T, C, H0, W0]``.
+        plane1:    fp32 CUDA tensor ``[T, C, H1, W1]``.
+        plane2:    fp32 CUDA tensor ``[T, C, H2, W2]``.
+        h:         finite-difference step in world ``[-1, 1]`` units.
+
+    Returns:
+        fp32 tensor ``[4, B, T*C]``, differentiable w.r.t. pts/rotations/planes.
+    """
+    _validate3("kplanes_tilted_tv_fuse3", pts, rotations, (plane0, plane1, plane2))
+    return _kplanes_tilted_tv_fuse3(pts, rotations, plane0, plane1, plane2, float(h))

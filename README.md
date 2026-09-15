@@ -82,6 +82,9 @@ loss.backward()
 | Function | Description |
 | --- | --- |
 | `kplanes_tilted_fuse(pts, rotations, plane)` | Fused TILTED K-Planes feature interpolation (one multiscale level): rotate → bilinear-sample 3 planes per rotation → Hadamard product, with analytic gradients w.r.t. points, rotations, and plane grids. Exactly matches `quantem`'s `interpolate_ms_features_tilted` per level. |
+| `kplanes_tilted_tv_fuse(pts, rotations, plane, h)` | The same computation at 4 tap locations per point (base plus one finite-difference step along each world axis), for TV regularization; output `[4, B, T*C]` with `out[0]` matching `kplanes_tilted_fuse`. |
+| `kplanes_tilted_fuse3(pts, rotations, plane0, plane1, plane2)` | `kplanes_tilted_fuse` with one tensor `[T, C, H, W]` per plane type, so each plane type can have its own resolution. Same output layout and channel order; bit-identical to `kplanes_tilted_fuse` when the three planes share a shape. |
+| `kplanes_tilted_tv_fuse3(pts, rotations, plane0, plane1, plane2, h)` | The 4-tap TV variant of `kplanes_tilted_fuse3`. |
 
 `quantem`'s `KPlanesTILTED` model lives in `quantem.core.ml.models.kplanes` and is shared
 across applications (tomography object models today); its kernels live here for the same
