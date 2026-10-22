@@ -18,10 +18,19 @@ from quantem.cuda import _core
 # ── fused TILTED K-Planes interpolation ───────────────────────────────────
 
 
+def _plane_grad_like(plane: Tensor) -> Tensor:
+    """Fake-tensor counterpart of a plane gradient: an NCHW view of a contiguous (T, H, W, C)
+    buffer, i.e. the strides the real backward ops return (= channels-last ``plane``)."""
+    t, c, h, w = plane.shape
+    return plane.new_empty((t, h, w, c)).permute(0, 3, 1, 2)
+
+
 def _channels_last(plane: Tensor) -> Tensor:
-    """(3T, C, H, W) → contiguous (3T, H, W, C) for the kernels. The grid is
-    tiny next to the per-point traffic, so this pass is noise — and it buys
-    contiguous per-cell channel reads inside the kernels."""
+    """(3T, C, H, W) → contiguous (3T, H, W, C) for the kernels (contiguous per-cell
+    channel reads). A free view when the plane is stored channels-last; otherwise a full copy of
+    the plane in EVERY forward and backward call, which for large grids (1e9+ parameters) costs
+    more than the kernels — store K-Planes grids channels-last
+    (``torch.empty(..., memory_format=torch.channels_last)``)."""
     return plane.permute(0, 2, 3, 1).contiguous()
 
 
@@ -79,19 +88,21 @@ def _kplanes_tilted_fuse_bwd(
             w,
             stream,
         )
-    # (3T, H, W, C) → (3T, C, H, W), matching the parameter layout
-    return [grad_pts, grad_r, grad_plane_cl.permute(0, 3, 1, 2).contiguous()]
+    # (3T, H, W, C) → (3T, C, H, W) as a VIEW (channels-last strides): no copy, and when the
+    # planes are stored channels-last it matches their strides, so AccumulateGrad keeps it as is
+    return [grad_pts, grad_r, grad_plane_cl.permute(0, 3, 1, 2)]
 
 
 @_kplanes_tilted_fuse_bwd.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor, grad_out: Tensor) -> list[Tensor]:
-    # new_empty (not empty_like): the real op returns CONTIGUOUS grads even for
-    # non-contiguous inputs (it zeros_like the .contiguous() copies), so the fake
-    # must not inherit input strides.
+    # new_empty (not empty_like): the real op returns pts / rotation grads CONTIGUOUS
+    # even for non-contiguous inputs (it zeros_like the .contiguous() copies), and plane
+    # grads channels-last (NCHW views of the kernel's (T, H, W, C) buffers), whatever the
+    # input strides.
     return [
         pts.new_empty(pts.shape),
         rotations.new_empty(rotations.shape),
-        plane.new_empty(plane.shape),
+        _plane_grad_like(plane),
     ]
 
 
@@ -188,17 +199,18 @@ def _kplanes_tilted_tv_fuse_bwd(
             float(h),
             stream,
         )
-    # (3T, H, W, C) → (3T, C, H, W), matching the parameter layout
-    return [grad_pts, grad_r, grad_plane_cl.permute(0, 3, 1, 2).contiguous()]
+    # (3T, H, W, C) → (3T, C, H, W) as a VIEW (channels-last strides): no copy, and when the
+    # planes are stored channels-last it matches their strides, so AccumulateGrad keeps it as is
+    return [grad_pts, grad_r, grad_plane_cl.permute(0, 3, 1, 2)]
 
 
 @_kplanes_tilted_tv_fuse_bwd.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor, grad_out: Tensor, h: float) -> list[Tensor]:
-    # new_empty (not empty_like): matches the real op's contiguous grads (see fwd bwd fake)
+    # matches the real op's grad layouts (see the fwd bwd fake)
     return [
         pts.new_empty(pts.shape),
         rotations.new_empty(rotations.shape),
-        plane.new_empty(plane.shape),
+        _plane_grad_like(plane),
     ]
 
 
@@ -319,8 +331,8 @@ def _kplanes_tilted_fuse3_bwd(
             hw[2][1],
             stream,
         )
-    # (T, H, W, C) → (T, C, H, W), matching the parameter layout
-    return [grad_pts, grad_r] + [gp.permute(0, 3, 1, 2).contiguous() for gp in grad_planes_cl]
+    # (T, H, W, C) → (T, C, H, W) as a VIEW (channels-last strides; see the single-tensor op)
+    return [grad_pts, grad_r] + [gp.permute(0, 3, 1, 2) for gp in grad_planes_cl]
 
 
 @_kplanes_tilted_fuse3_bwd.register_fake
@@ -332,15 +344,16 @@ def _(
     plane2: Tensor,
     grad_out: Tensor,
 ) -> list[Tensor]:
-    # new_empty (not empty_like): the real op returns CONTIGUOUS grads even for
-    # non-contiguous inputs (it zeros_like the .contiguous() copies), so the fake
-    # must not inherit input strides.
+    # new_empty (not empty_like): the real op returns pts / rotation grads CONTIGUOUS
+    # even for non-contiguous inputs (it zeros_like the .contiguous() copies), and plane
+    # grads channels-last (NCHW views of the kernel's (T, H, W, C) buffers), whatever the
+    # input strides.
     return [
         pts.new_empty(pts.shape),
         rotations.new_empty(rotations.shape),
-        plane0.new_empty(plane0.shape),
-        plane1.new_empty(plane1.shape),
-        plane2.new_empty(plane2.shape),
+        _plane_grad_like(plane0),
+        _plane_grad_like(plane1),
+        _plane_grad_like(plane2),
     ]
 
 
@@ -451,8 +464,8 @@ def _kplanes_tilted_tv_fuse3_bwd(
             float(h),
             stream,
         )
-    # (T, H, W, C) → (T, C, H, W), matching the parameter layout
-    return [grad_pts, grad_r] + [gp.permute(0, 3, 1, 2).contiguous() for gp in grad_planes_cl]
+    # (T, H, W, C) → (T, C, H, W) as a VIEW (channels-last strides; see the single-tensor op)
+    return [grad_pts, grad_r] + [gp.permute(0, 3, 1, 2) for gp in grad_planes_cl]
 
 
 @_kplanes_tilted_tv_fuse3_bwd.register_fake
@@ -465,13 +478,13 @@ def _(
     grad_out: Tensor,
     h: float,
 ) -> list[Tensor]:
-    # new_empty (not empty_like): matches the real op's contiguous grads
+    # matches the real op's grad layouts (see the fwd bwd fake)
     return [
         pts.new_empty(pts.shape),
         rotations.new_empty(rotations.shape),
-        plane0.new_empty(plane0.shape),
-        plane1.new_empty(plane1.shape),
-        plane2.new_empty(plane2.shape),
+        _plane_grad_like(plane0),
+        _plane_grad_like(plane1),
+        _plane_grad_like(plane2),
     ]
 
 

@@ -216,6 +216,27 @@ def test_fuse3_non_contiguous_inputs():
 
 
 @requires_cuda
+def test_fuse3_channels_last_planes():
+    """Channels-last planes (how quantem stores K-Planes grids) give the same output and plane
+    gradients as NCHW planes, and the gradients come back with the planes' own strides."""
+    cfg = (300, 3, 6, (9, 11), (11, 5), (5, 9))
+    pts, rotations, p0, p1, p2 = _inputs3(*cfg)
+    planes = [p.detach().requires_grad_(True) for p in (p0, p1, p2)]
+    planes_cl = [
+        p.detach().contiguous(memory_format=torch.channels_last).requires_grad_(True)
+        for p in (p0, p1, p2)
+    ]
+    out = kplanes_tilted_fuse3(pts, rotations, *planes)
+    out_cl = kplanes_tilted_fuse3(pts, rotations, *planes_cl)
+    torch.testing.assert_close(out_cl, out, rtol=0, atol=0)
+    g = torch.autograd.grad(out.square().sum(), planes)
+    g_cl = torch.autograd.grad(out_cl.square().sum(), planes_cl)
+    for a, b, p in zip(g_cl, g, planes_cl):
+        torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
+        assert a.stride() == p.stride()
+
+
+@requires_cuda
 def test_fuse3_upstream_grad_scaling():
     cfg = (64, 2, 4, (9, 7), (7, 11), (11, 9))
     pts, rotations, p0, p1, p2 = _inputs3(*cfg, requires_grad=True)
