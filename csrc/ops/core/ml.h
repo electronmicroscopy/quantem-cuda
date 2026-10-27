@@ -151,3 +151,32 @@ void kplanes_tilted_tv_fuse3_grad_cuda(
     float h,
     cudaStream_t stream
 );
+
+/* ── splat tomography: fused 2D Gaussian stamping ─────────────────────────
+ * Forward: accumulate T tilt images of N isotropic Gaussians. u [T,N,2]
+ * fractional pixel centres (row, col); a [N] pixel-integrated mass; s [N]
+ * width in pixels; out [T,H,W] is ACCUMULATED INTO (caller pre-zeroes).
+ * Window = rint(u) + {-r..r}², clipped to the image. */
+void splat_stamp_fwd_cuda(
+    const float *d_u,
+    const float *d_a,
+    const float *d_s,
+    float       *d_out,
+    long T, long N, int H, int W, int r,
+    cudaStream_t stream
+);
+
+/* Backward of splat_stamp. gout [T,H,W]; gu [T,N,2] and the per-(tilt, atom)
+ * partials ga_part [T,N], gs_part [T,N] are fully written (no atomics; the
+ * caller sums the partials over tilts for the [N] amplitude / width grads). */
+void splat_stamp_bwd_cuda(
+    const float *d_u,
+    const float *d_a,
+    const float *d_s,
+    const float *d_gout,
+    float       *d_gu,
+    float       *d_ga_part,
+    float       *d_gs_part,
+    long T, long N, int H, int W, int r,
+    cudaStream_t stream
+);

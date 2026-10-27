@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "quantem-cuda"
-version = "0.1.0+peraxis2"
+version = "0.1.0+splat1"
 description = "CUDA-accelerated kernels for the quantem electron-microscopy toolkit."
 keywords = ["EM", "TEM", "STEM", "4DSTEM", "tomography", "CUDA"]
 readme = "README.md"

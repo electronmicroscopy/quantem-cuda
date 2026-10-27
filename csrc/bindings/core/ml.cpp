@@ -178,6 +178,40 @@ static void py_kplanes_tilted_tv_fuse3_grad_cuda(
     );
 }
 
+static void py_splat_stamp_fwd_cuda(
+    long u_ptr, long a_ptr, long s_ptr, long out_ptr,
+    long T, long N, int H, int W, int r,
+    long stream_ptr
+) {
+    splat_stamp_fwd_cuda(
+        reinterpret_cast<const float *>(u_ptr),
+        reinterpret_cast<const float *>(a_ptr),
+        reinterpret_cast<const float *>(s_ptr),
+        reinterpret_cast<float *>(out_ptr),
+        T, N, H, W, r,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_splat_stamp_bwd_cuda(
+    long u_ptr, long a_ptr, long s_ptr, long gout_ptr,
+    long gu_ptr, long ga_part_ptr, long gs_part_ptr,
+    long T, long N, int H, int W, int r,
+    long stream_ptr
+) {
+    splat_stamp_bwd_cuda(
+        reinterpret_cast<const float *>(u_ptr),
+        reinterpret_cast<const float *>(a_ptr),
+        reinterpret_cast<const float *>(s_ptr),
+        reinterpret_cast<const float *>(gout_ptr),
+        reinterpret_cast<float *>(gu_ptr),
+        reinterpret_cast<float *>(ga_part_ptr),
+        reinterpret_cast<float *>(gs_part_ptr),
+        T, N, H, W, r,
+        to_stream(stream_ptr)
+    );
+}
+
 void register_core_ml_ops(py::module_ &m) {
     m.def("kplanes_tilted_fuse_cuda", &py_kplanes_tilted_fuse_cuda,
           "Fused TILTED K-Planes interpolation (one level). pts_ptr: fp32 "
@@ -265,6 +299,23 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("H0"), py::arg("W0"), py::arg("H1"), py::arg("W1"),
           py::arg("H2"), py::arg("W2"),
           py::arg("h"), py::arg("stream_ptr"));
+
+    m.def("splat_stamp_fwd_cuda", &py_splat_stamp_fwd_cuda,
+          "Splat tomography forward: stamp N 2D Gaussians into T images. "
+          "u_ptr: fp32 [T,N,2] pixel centres (row, col); a_ptr: fp32 [N] "
+          "pixel-integrated mass; s_ptr: fp32 [N] width in px; out_ptr: fp32 "
+          "[T,H,W] pre-zeroed, accumulated into. r: window half-width in px.",
+          py::arg("u_ptr"), py::arg("a_ptr"), py::arg("s_ptr"), py::arg("out_ptr"),
+          py::arg("T"), py::arg("N"), py::arg("H"), py::arg("W"), py::arg("r"),
+          py::arg("stream_ptr"));
+
+    m.def("splat_stamp_bwd_cuda", &py_splat_stamp_bwd_cuda,
+          "Backward of splat_stamp. gout_ptr: fp32 [T,H,W]. gu_ptr [T,N,2], "
+          "ga_part_ptr [T,N], gs_part_ptr [T,N] are fully written (no atomics).",
+          py::arg("u_ptr"), py::arg("a_ptr"), py::arg("s_ptr"), py::arg("gout_ptr"),
+          py::arg("gu_ptr"), py::arg("ga_part_ptr"), py::arg("gs_part_ptr"),
+          py::arg("T"), py::arg("N"), py::arg("H"), py::arg("W"), py::arg("r"),
+          py::arg("stream_ptr"));
 }
 
 }  // namespace quantem_cuda

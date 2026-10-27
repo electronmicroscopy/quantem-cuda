@@ -739,3 +739,172 @@ def kplanes_tilted_tv_fuse3(
     """
     _validate3("kplanes_tilted_tv_fuse3", pts, rotations, (plane0, plane1, plane2))
     return _kplanes_tilted_tv_fuse3(pts, rotations, plane0, plane1, plane2, float(h))
+
+
+# ── splat tomography: fused 2D Gaussian stamping ─────────────────────────
+#
+# splat_stamp renders T tilt images of N isotropic Gaussians from their
+# projected pixel centres (the pose logic, u = pi(R p + s), stays in torch
+# in quantem.core.ml.splat.renderer). Pixel units throughout: amps are the
+# pixel-integrated masses (A / sampling²) and sigmas the widths in pixels.
+# The backward returns grads to centres, amps and sigmas; the image-shape
+# ints and the window radius carry no gradient.
+
+
+@torch.library.custom_op("quantem_cuda::splat_stamp", mutates_args=())
+def _splat_stamp(
+    centers: Tensor, amps: Tensor, sigmas: Tensor, height: int, width: int, radius: int
+) -> Tensor:
+    u = centers.contiguous()
+    a = amps.contiguous()
+    s = sigmas.contiguous()
+    t, n = int(u.shape[0]), int(u.shape[1])
+    out = torch.zeros((t, height, width), dtype=torch.float32, device=u.device)
+    stream = torch.cuda.current_stream(u.device).cuda_stream
+    with torch.cuda.device(u.device):
+        _core.splat_stamp_fwd_cuda(
+            u.data_ptr(),
+            a.data_ptr(),
+            s.data_ptr(),
+            out.data_ptr(),
+            t,
+            n,
+            int(height),
+            int(width),
+            int(radius),
+            stream,
+        )
+    return out
+
+
+@_splat_stamp.register_fake
+def _(
+    centers: Tensor, amps: Tensor, sigmas: Tensor, height: int, width: int, radius: int
+) -> Tensor:
+    return centers.new_empty((centers.shape[0], height, width), dtype=torch.float32)
+
+
+@torch.library.custom_op("quantem_cuda::splat_stamp_bwd", mutates_args=())
+def _splat_stamp_bwd(
+    centers: Tensor, amps: Tensor, sigmas: Tensor, grad_out: Tensor, radius: int
+) -> list[Tensor]:
+    u = centers.contiguous()
+    a = amps.contiguous()
+    s = sigmas.contiguous()
+    t, n = int(u.shape[0]), int(u.shape[1])
+    gout = grad_out.detach().to(dtype=torch.float32, device=u.device).contiguous()
+    h, w = int(gout.shape[1]), int(gout.shape[2])
+    grad_u = torch.empty_like(u)  # fully written by the kernel
+    ga_part = torch.empty((t, n), dtype=torch.float32, device=u.device)
+    gs_part = torch.empty((t, n), dtype=torch.float32, device=u.device)
+    stream = torch.cuda.current_stream(u.device).cuda_stream
+    with torch.cuda.device(u.device):
+        _core.splat_stamp_bwd_cuda(
+            u.data_ptr(),
+            a.data_ptr(),
+            s.data_ptr(),
+            gout.data_ptr(),
+            grad_u.data_ptr(),
+            ga_part.data_ptr(),
+            gs_part.data_ptr(),
+            t,
+            n,
+            h,
+            w,
+            int(radius),
+            stream,
+        )
+    # the per-tilt partials are summed here (deterministic), not with atomics in the kernel
+    return [grad_u, ga_part.sum(dim=0), gs_part.sum(dim=0)]
+
+
+@_splat_stamp_bwd.register_fake
+def _(
+    centers: Tensor, amps: Tensor, sigmas: Tensor, grad_out: Tensor, radius: int
+) -> list[Tensor]:
+    return [
+        centers.new_empty(centers.shape),
+        amps.new_empty(amps.shape),
+        sigmas.new_empty(sigmas.shape),
+    ]
+
+
+def _splat_setup_context(ctx, inputs, output) -> None:
+    centers, amps, sigmas, height, width, radius = inputs
+    ctx.save_for_backward(centers, amps, sigmas)
+    ctx.radius = radius
+
+
+def _splat_backward(ctx, grad_out):
+    centers, amps, sigmas = ctx.saved_tensors
+    grad_u, grad_a, grad_s = _splat_stamp_bwd(centers, amps, sigmas, grad_out, ctx.radius)
+    return grad_u, grad_a, grad_s, None, None, None
+
+
+_splat_stamp.register_autograd(_splat_backward, setup_context=_splat_setup_context)
+
+
+def splat_stamp(
+    centers: Tensor,
+    amps: Tensor,
+    sigmas: Tensor,
+    image_shape: tuple[int, int],
+    radius: int,
+) -> Tensor:
+    """Stamp ``N`` isotropic 2D Gaussians into ``T`` images (fused forward + backward).
+
+    The image model of ``quantem.core.ml.splat.renderer.render_projections`` in pixel units::
+
+        out[t, i, j] = sum_n amps[n] / (2 pi sigmas[n]^2)
+                       * exp(-((i - centers[t, n, 0])^2 + (j - centers[t, n, 1])^2) / (2 sigmas[n]^2))
+
+    over the atoms whose window ``round(centers[t, n]) + {-radius..radius}^2`` (round half to
+    even, clipped to the image) contains pixel ``(i, j)``; the Gaussian is evaluated at the
+    pixel centres, not integrated. Nothing per (tilt, atom, pixel) is stored, so the memory is
+    the output plus the inputs whatever the atom count.
+
+    Parameters
+    ----------
+    centers : Tensor
+        ``(T, N, 2)`` fp32 CUDA, fractional pixel coordinates ordered ``(row, col)``.
+    amps : Tensor
+        ``(N,)`` fp32 CUDA, pixel-integrated mass per Gaussian (``A / sampling**2``).
+    sigmas : Tensor
+        ``(N,)`` fp32 CUDA, width in pixels (``sigma / sampling``), positive.
+    image_shape : tuple[int, int]
+        ``(H, W)``.
+    radius : int
+        Window half-width in pixels (``>= 0``).
+
+    Returns
+    -------
+    Tensor
+        ``(T, H, W)`` fp32 images; differentiable in ``centers``, ``amps`` and ``sigmas``.
+        The backward is deterministic; the forward accumulates with atomics (fp32 round-off).
+    """
+    fn = "splat_stamp"
+    if centers.ndim != 3 or centers.shape[2] != 2:
+        raise ValueError(f"{fn} expects centers [T, N, 2], got {tuple(centers.shape)}")
+    n = centers.shape[1]
+    for name, t in (("amps", amps), ("sigmas", sigmas)):
+        if t.ndim != 1 or t.shape[0] != n:
+            raise ValueError(f"{fn} expects {name} [N] with N = {n}, got {tuple(t.shape)}")
+    for name, t in (("centers", centers), ("amps", amps), ("sigmas", sigmas)):
+        if t.dtype != torch.float32:
+            raise TypeError(f"{fn} is fp32-only ({name} is {t.dtype}).")
+        if not t.is_cuda:
+            raise ValueError(f"{fn} requires CUDA tensors ({name} on {t.device}).")
+        if t.device != centers.device:
+            raise ValueError(
+                f"{fn} requires all tensors on one device ({name} on {t.device}, "
+                f"centers on {centers.device})."
+            )
+    if len(image_shape) != 2:
+        raise ValueError(f"{fn} expects image_shape (H, W), got {tuple(image_shape)}")
+    h, w = int(image_shape[0]), int(image_shape[1])
+    if h <= 0 or w <= 0 or h * w >= 2**31:
+        raise ValueError(f"{fn}: image shape {(h, w)} must be positive with H * W < 2**31")
+    r = int(radius)
+    if r < 0:
+        raise ValueError(f"{fn}: radius must be >= 0, got {radius}")
+    return _splat_stamp(centers, amps, sigmas, h, w, r)

@@ -135,6 +135,7 @@ pybind11_add_module(_core
     csrc/bindings/core/ml.cpp
     csrc/cuda/core/tv_loss.cu
     csrc/cuda/core/ml/kplanes_tilted.cu
+    csrc/cuda/core/ml/splat_stamp.cu
 )
 target_include_directories(_core PRIVATE csrc)
 target_link_libraries(_core PRIVATE CUDA::cudart)
